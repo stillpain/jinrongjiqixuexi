@@ -1,6 +1,10 @@
 # Large/raw datasets
+*.csv
 CHN_sample_data.csv
+CHN_Macro_sample.csv
+CHN_Marco_predictors.csv
 data/
+outputs/
 
 # Python/runtime artifacts
 __pycache__/
@@ -15,4 +19,3 @@ env/
 # OS/editor files
 .DS_Store
 Thumbs.db
-
