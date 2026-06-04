@@ -54,6 +54,18 @@ def parse_args() -> argparse.Namespace:
             "rows with any missing feature; none leaves missing values in place."
         ),
     )
+    parser.add_argument("--train-start", type=int, default=TRAIN_START,
+                        help="First YYYYMM of training period.")
+    parser.add_argument("--train-end",   type=int, default=TRAIN_END,
+                        help="Last YYYYMM of training period.")
+    parser.add_argument("--valid-start", type=int, default=VALID_START,
+                        help="First YYYYMM of validation period.")
+    parser.add_argument("--valid-end",   type=int, default=VALID_END,
+                        help="Last YYYYMM of validation period.")
+    parser.add_argument("--sim-start",   type=int, default=SIM_START,
+                        help="First YYYYMM of simulation period.")
+    parser.add_argument("--sim-end",     type=int, default=SIM_END,
+                        help="Last YYYYMM of simulation period.")
     return parser.parse_args()
 
 
@@ -114,11 +126,19 @@ def load_lagged_macro(path: Path) -> pd.DataFrame:
     return lagged
 
 
-def assign_split(dates: pd.Series) -> pd.Series:
+def assign_split(
+    dates: pd.Series,
+    train_start: int = TRAIN_START,
+    train_end: int = TRAIN_END,
+    valid_start: int = VALID_START,
+    valid_end: int = VALID_END,
+    sim_start: int = SIM_START,
+    sim_end: int = SIM_END,
+) -> pd.Series:
     split = pd.Series(pd.NA, index=dates.index, dtype="object")
-    split.loc[dates.between(TRAIN_START, TRAIN_END)] = "train"
-    split.loc[dates.between(VALID_START, VALID_END)] = "valid"
-    split.loc[dates.between(SIM_START, SIM_END)] = "sim"
+    split.loc[dates.between(train_start, train_end)] = "train"
+    split.loc[dates.between(valid_start, valid_end)] = "valid"
+    split.loc[dates.between(sim_start, sim_end)] = "sim"
     return split
 
 
@@ -144,10 +164,10 @@ def handle_feature_missing(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
         return df
 
     if strategy == "monthly-median":
+        train_medians = df.loc[df["split"] == "train", features].median(numeric_only=True)
         df[features] = df.groupby("Dates", sort=False)[features].transform(
             lambda col: col.fillna(col.median())
         )
-        train_medians = df.loc[df["split"] == "train", features].median(numeric_only=True)
         df[features] = df[features].fillna(train_medians)
         missing_after = int(df[features].isna().sum().sum())
         print(
@@ -204,6 +224,12 @@ def build_cleaned_panel(
     macro_path: Path,
     keep_zero_return: bool,
     missing_strategy: str,
+    train_start: int = TRAIN_START,
+    train_end: int = TRAIN_END,
+    valid_start: int = VALID_START,
+    valid_end: int = VALID_END,
+    sim_start: int = SIM_START,
+    sim_end: int = SIM_END,
 ) -> pd.DataFrame:
     stock = load_stock_panel(stock_path)
     macro = load_lagged_macro(macro_path)
@@ -215,7 +241,10 @@ def build_cleaned_panel(
         cleaned = cleaned[cleaned["y_next"] != 0].copy()
 
     cleaned["label"] = (cleaned["y_next"] > 0).astype(int)
-    cleaned["split"] = assign_split(cleaned["Dates"])
+    cleaned["split"] = assign_split(
+        cleaned["Dates"],
+        train_start, train_end, valid_start, valid_end, sim_start, sim_end,
+    )
     cleaned = cleaned.dropna(subset=["split"]).copy()
     cleaned = cleaned.sort_values(["Dates", "stkcd"]).reset_index(drop=True)
     cleaned = handle_feature_missing(cleaned, missing_strategy)
@@ -261,6 +290,12 @@ def main() -> None:
         macro_path,
         args.keep_zero_return,
         args.missing_strategy,
+        train_start=args.train_start,
+        train_end=args.train_end,
+        valid_start=args.valid_start,
+        valid_end=args.valid_end,
+        sim_start=args.sim_start,
+        sim_end=args.sim_end,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cleaned.to_csv(out_path, index=False)

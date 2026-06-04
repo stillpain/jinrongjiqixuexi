@@ -18,6 +18,7 @@ METRIC_COLUMNS = [
     "f1",
     "threshold",
     "rows",
+    "threshold_source",
 ]
 
 
@@ -86,6 +87,18 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for reproducible model training.",
     )
+    parser.add_argument(
+        "--risk-free-monthly",
+        type=float,
+        default=0.0,
+        help="Monthly risk-free rate subtracted from returns when computing Sharpe ratio (e.g. 0.002 for ~2.4%% annualized).",
+    )
+    parser.add_argument(
+        "--portfolio-quantile",
+        type=float,
+        default=0.1,
+        help="Top/bottom quantile for long-short portfolio construction (e.g. 0.1 for top/bottom 10%%).",
+    )
     return parser.parse_args()
 
 
@@ -126,6 +139,7 @@ def rf_candidates(RandomForestClassifier, random_state: int, n_jobs: int):
                 n_estimators=300,
                 max_depth=8,
                 min_samples_leaf=50,
+                class_weight="balanced_subsample",
                 random_state=random_state,
                 n_jobs=n_jobs,
             ),
@@ -136,6 +150,7 @@ def rf_candidates(RandomForestClassifier, random_state: int, n_jobs: int):
                 n_estimators=300,
                 max_depth=12,
                 min_samples_leaf=30,
+                class_weight="balanced_subsample",
                 random_state=random_state,
                 n_jobs=n_jobs,
             ),
@@ -146,6 +161,7 @@ def rf_candidates(RandomForestClassifier, random_state: int, n_jobs: int):
                 n_estimators=300,
                 max_depth=16,
                 min_samples_leaf=20,
+                class_weight="balanced_subsample",
                 random_state=random_state,
                 n_jobs=n_jobs,
             ),
@@ -227,6 +243,7 @@ def compute_metrics(
     prob: pd.Series,
     deps: dict,
     threshold: float,
+    threshold_source: str = "",
 ) -> dict:
     pred = (prob >= threshold).astype(int)
     try:
@@ -245,6 +262,7 @@ def compute_metrics(
         "f1": deps["f1_score"](y_true, pred, zero_division=0),
         "threshold": threshold,
         "rows": len(y_true),
+        "threshold_source": threshold_source,
     }
 
 
@@ -267,7 +285,8 @@ def select_best_model(
         model.fit(X_train, y_train)
         valid_prob = predict_prob(model, X_valid)
         threshold = optimize_threshold(y_valid, valid_prob, deps)
-        row = compute_metrics(name, "valid", y_valid, valid_prob, deps, threshold)
+        row = compute_metrics(name, "valid", y_valid, valid_prob, deps, threshold,
+                              threshold_source="optimized_on_valid")
         validation_rows.append(row)
         candidate_auc = row["auc"]
         if pd.notna(candidate_auc) and candidate_auc > best_auc:
@@ -293,6 +312,7 @@ def select_xgb_model(
     X_valid: pd.DataFrame,
     y_valid: pd.Series,
     deps: dict,
+    scale_factor: float = 1.0,
 ) -> tuple[str, object, float, list[dict]]:
     validation_rows = []
     best_name = ""
@@ -309,7 +329,10 @@ def select_xgb_model(
             verbose=False,
         )
         best_iteration = getattr(model, "best_iteration", None)
-        best_n_estimators = model.n_estimators if best_iteration is None else best_iteration + 1
+        raw_best = model.n_estimators if best_iteration is None else best_iteration + 1
+        scaled = int(raw_best * scale_factor)
+        max_cap = int(model.n_estimators * 1.5)
+        best_n_estimators = min(max(scaled, 1), max_cap)
 
         params = model.get_params()
         params.pop("early_stopping_rounds", None)
@@ -319,7 +342,8 @@ def select_xgb_model(
 
         valid_prob = predict_prob(final_model, X_valid)
         threshold = optimize_threshold(y_valid, valid_prob, deps)
-        row = compute_metrics(name, "valid", y_valid, valid_prob, deps, threshold)
+        row = compute_metrics(name, "valid", y_valid, valid_prob, deps, threshold,
+                              threshold_source="optimized_on_valid")
         row["model"] = f"{name}_best{best_n_estimators}"
         validation_rows.append(row)
 
@@ -353,7 +377,7 @@ def portfolio_returns(
     quantile: float = 0.1,
 ) -> pd.DataFrame:
     frame = sim[["Dates", "stkcd", "y_next"]].copy()
-    frame["prob"] = prob.values
+    frame["prob"] = prob
     rows = []
     for date, group in frame.groupby("Dates", sort=True):
         if len(group) < 2:
@@ -382,12 +406,13 @@ def max_drawdown(returns: pd.Series) -> float:
     return drawdown.min()
 
 
-def portfolio_summary(portfolio_df: pd.DataFrame) -> pd.DataFrame:
+def portfolio_summary(portfolio_df: pd.DataFrame, risk_free_monthly: float = 0.0) -> pd.DataFrame:
     rows = []
     for model, group in portfolio_df.groupby("model", sort=False):
         for column in ["long_return", "short_return", "long_short_return"]:
             returns = group[column]
-            std = returns.std()
+            excess = returns - risk_free_monthly
+            std = excess.std()
             rows.append(
                 {
                     "model": model,
@@ -395,7 +420,7 @@ def portfolio_summary(portfolio_df: pd.DataFrame) -> pd.DataFrame:
                     "months": len(returns),
                     "mean_monthly_return": returns.mean(),
                     "annualized_return": (1 + returns.mean()) ** 12 - 1,
-                    "annualized_sharpe": float("nan") if std == 0 else returns.mean() / std * sqrt(12),
+                    "annualized_sharpe": float("nan") if std == 0 else excess.mean() / std * sqrt(12),
                     "max_drawdown": max_drawdown(returns),
                     "cumulative_return": (1 + returns).prod() - 1,
                 }
@@ -437,7 +462,11 @@ def main() -> int:
         y_valid,
         deps,
     )
-    early_stop_mask = train["Dates"] >= 201501
+    train_dates_sorted = sorted(train["Dates"].unique())
+    n_full_dates = len(train_dates_sorted)
+    n_inner_dates = max(1, int(n_full_dates * 0.8))
+    inner_cutoff = train_dates_sorted[n_inner_dates - 1]
+    early_stop_mask = train["Dates"] > inner_cutoff
     if early_stop_mask.all() or not early_stop_mask.any():
         raise ValueError("Cannot create internal XGBoost early-stopping split from train dates.")
 
@@ -462,6 +491,7 @@ def main() -> int:
         X_valid,
         y_valid,
         deps,
+        scale_factor=n_full_dates / n_inner_dates,
     )
 
     rf_valid_prob = predict_prob(rf_model, X_valid)
@@ -473,18 +503,22 @@ def main() -> int:
     metrics.extend(rf_valid_rows)
     metrics.extend(xgb_valid_rows)
     metrics.append(
-        compute_metrics(f"{rf_name}_selected", "valid", y_valid, rf_valid_prob, deps, rf_threshold)
+        compute_metrics(f"{rf_name}_selected", "valid", y_valid, rf_valid_prob, deps, rf_threshold,
+                        threshold_source="optimized_on_valid")
     )
     metrics.append(
-        compute_metrics(f"{rf_name}_selected", "sim", y_sim, rf_sim_prob, deps, rf_threshold)
+        compute_metrics(f"{rf_name}_selected", "sim", y_sim, rf_sim_prob, deps, rf_threshold,
+                        threshold_source="held_out")
     )
     metrics.append(
         compute_metrics(
-            f"{xgb_name}_selected", "valid", y_valid, xgb_valid_prob, deps, xgb_threshold
+            f"{xgb_name}_selected", "valid", y_valid, xgb_valid_prob, deps, xgb_threshold,
+            threshold_source="optimized_on_valid",
         )
     )
     metrics.append(
-        compute_metrics(f"{xgb_name}_selected", "sim", y_sim, xgb_sim_prob, deps, xgb_threshold)
+        compute_metrics(f"{xgb_name}_selected", "sim", y_sim, xgb_sim_prob, deps, xgb_threshold,
+                        threshold_source="held_out")
     )
 
     metrics_df = pd.DataFrame(metrics, columns=METRIC_COLUMNS)
@@ -492,8 +526,8 @@ def main() -> int:
     metrics_df.to_csv(metrics_path, index=False)
 
     sim_predictions = sim[["Dates", "stkcd", "y_next", "label"]].copy()
-    sim_predictions["rf_prob"] = rf_sim_prob.values
-    sim_predictions["xgb_prob"] = xgb_sim_prob.values
+    sim_predictions["rf_prob"] = rf_sim_prob
+    sim_predictions["xgb_prob"] = xgb_sim_prob
     sim_predictions["rf_pred"] = (sim_predictions["rf_prob"] >= rf_threshold).astype(int)
     sim_predictions["xgb_pred"] = (sim_predictions["xgb_prob"] >= xgb_threshold).astype(int)
     sim_predictions.to_csv(out_dir / "sim_predictions.csv", index=False)
@@ -507,13 +541,15 @@ def main() -> int:
 
     portfolios = pd.concat(
         [
-            portfolio_returns(sim, rf_sim_prob, f"{rf_name}_selected"),
-            portfolio_returns(sim, xgb_sim_prob, f"{xgb_name}_selected"),
+            portfolio_returns(sim, rf_sim_prob, f"{rf_name}_selected", quantile=args.portfolio_quantile),
+            portfolio_returns(sim, xgb_sim_prob, f"{xgb_name}_selected", quantile=args.portfolio_quantile),
         ],
         ignore_index=True,
     )
     portfolios.to_csv(out_dir / "portfolio_returns.csv", index=False)
-    portfolio_summary(portfolios).to_csv(out_dir / "portfolio_summary.csv", index=False)
+    portfolio_summary(portfolios, risk_free_monthly=args.risk_free_monthly).to_csv(
+        out_dir / "portfolio_summary.csv", index=False
+    )
 
     print(f"Selected Random Forest: {rf_name}")
     print(f"Selected XGBoost: {xgb_name}")
@@ -523,6 +559,10 @@ def main() -> int:
     print(f"Saved metrics: {metrics_path}")
     print(f"Saved simulation predictions: {out_dir / 'sim_predictions.csv'}")
     print(f"Saved portfolio outputs: {out_dir / 'portfolio_returns.csv'}")
+    print(
+        "Note: valid metrics use threshold optimized on the same split. "
+        "sim metrics are held_out and unbiased."
+    )
     return 0
 
 
