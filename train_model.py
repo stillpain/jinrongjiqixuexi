@@ -427,8 +427,14 @@ def portfolio_summary(
         "short_return": 2 * transaction_cost,
         "long_short_return": 4 * transaction_cost,
     }
+    has_seed = "seed" in portfolio_df.columns
+    group_cols = ["model", "seed"] if has_seed else ["model"]
     rows = []
-    for model, group in portfolio_df.groupby("model", sort=False):
+    for group_key, group in portfolio_df.groupby(group_cols, sort=False):
+        if has_seed:
+            model, seed_val = group_key
+        else:
+            model, seed_val = group_key, None
         for column in ["long_return", "short_return", "long_short_return"]:
             returns = group[column]
             excess = returns - risk_free_monthly
@@ -436,23 +442,24 @@ def portfolio_summary(
             returns_ac = returns - cost_map[column]
             excess_ac = returns_ac - risk_free_monthly
             std_ac = excess_ac.std()
-            rows.append(
-                {
-                    "model": model,
-                    "portfolio": column,
-                    "months": len(returns),
-                    "mean_monthly_return": returns.mean(),
-                    "annualized_return": (1 + returns.mean()) ** 12 - 1,
-                    "annualized_sharpe": float("nan") if std == 0 else excess.mean() / std * sqrt(12),
-                    "max_drawdown": max_drawdown(returns),
-                    "cumulative_return": (1 + returns).prod() - 1,
-                    "mean_monthly_return_ac": returns_ac.mean(),
-                    "annualized_return_ac": (1 + returns_ac.mean()) ** 12 - 1,
-                    "annualized_sharpe_ac": float("nan") if std_ac == 0 else excess_ac.mean() / std_ac * sqrt(12),
-                    "max_drawdown_ac": max_drawdown(returns_ac),
-                    "cumulative_return_ac": (1 + returns_ac).prod() - 1,
-                }
-            )
+            row = {
+                "model": model,
+                "portfolio": column,
+                "months": len(returns),
+                "mean_monthly_return": returns.mean(),
+                "annualized_return": (1 + returns.mean()) ** 12 - 1,
+                "annualized_sharpe": float("nan") if std == 0 else excess.mean() / std * sqrt(12),
+                "max_drawdown": max_drawdown(returns),
+                "cumulative_return": (1 + returns).prod() - 1,
+                "mean_monthly_return_ac": returns_ac.mean(),
+                "annualized_return_ac": (1 + returns_ac.mean()) ** 12 - 1,
+                "annualized_sharpe_ac": float("nan") if std_ac == 0 else excess_ac.mean() / std_ac * sqrt(12),
+                "max_drawdown_ac": max_drawdown(returns_ac),
+                "cumulative_return_ac": (1 + returns_ac).prod() - 1,
+            }
+            if seed_val is not None:
+                row["seed"] = seed_val
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -612,11 +619,12 @@ def main() -> int:
     avg_importance(all_xgb_imps).to_csv(out_dir / "feature_importance_xgb.csv", index=False)
 
     portfolios_df.to_csv(out_dir / "portfolio_returns.csv", index=False)
-    portfolio_summary(
+    summary_df = portfolio_summary(
         portfolios_df,
         risk_free_monthly=args.risk_free_monthly,
         transaction_cost=args.transaction_cost,
-    ).to_csv(out_dir / "portfolio_summary.csv", index=False)
+    )
+    summary_df.to_csv(out_dir / "portfolio_summary.csv", index=False)
 
     if len(args.random_seeds) > 1:
         sim_sel = metrics_df[
@@ -629,6 +637,18 @@ def main() -> int:
             grp = sim_sel.loc[mask, "auc"]
             if not grp.empty:
                 print(f"[aggregate {label}] sim AUC = {grp.mean():.4f} ± {grp.std():.4f}")
+
+        ls_summary = summary_df[summary_df["portfolio"] == "long_short_return"]
+        for label, mask in [
+            ("RF", ls_summary["model"].str.contains("rf", case=False)),
+            ("XGB", ls_summary["model"].str.contains("xgb", case=False)),
+        ]:
+            grp = ls_summary.loc[mask, "annualized_sharpe_ac"]
+            if not grp.empty:
+                print(
+                    f"[aggregate {label}] long-short Sharpe (after-cost) = "
+                    f"{grp.mean():.4f} ± {grp.std():.4f}"
+                )
 
     print(f"Saved metrics: {metrics_path}")
     print(
