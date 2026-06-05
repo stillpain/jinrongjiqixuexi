@@ -82,16 +82,23 @@ def parse_args() -> argparse.Namespace:
         help="Parallel workers for supported models.",
     )
     parser.add_argument(
-        "--random-state",
+        "--random-seeds",
+        nargs="+",
         type=int,
-        default=42,
-        help="Random seed for reproducible model training.",
+        default=[42],
+        help="Random seeds for training (e.g. --random-seeds 42 123 456). Multiple seeds enable robustness checks.",
     )
     parser.add_argument(
         "--risk-free-monthly",
         type=float,
         default=0.0,
         help="Monthly risk-free rate subtracted from returns when computing Sharpe ratio (e.g. 0.002 for ~2.4%% annualized).",
+    )
+    parser.add_argument(
+        "--transaction-cost",
+        type=float,
+        default=0.0,
+        help="One-way transaction cost per trade (e.g. 0.001 for 0.1%%). Applied as 2× per leg, 4× for long-short, per month.",
     )
     parser.add_argument(
         "--portfolio-quantile",
@@ -175,7 +182,7 @@ def xgb_candidates(XGBClassifier, random_state: int, n_jobs: int, scale_pos_weig
         "eval_metric": "auc",
         "tree_method": "hist",
         "scale_pos_weight": scale_pos_weight,
-        "early_stopping_rounds": 50,
+        "early_stopping_rounds": 100,
         "random_state": random_state,
         "n_jobs": n_jobs,
     }
@@ -200,19 +207,22 @@ def xgb_candidates(XGBClassifier, random_state: int, n_jobs: int, scale_pos_weig
                 learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                reg_lambda=2.0,
+                reg_lambda=3.0,
+                min_child_weight=15,
                 **common,
             ),
         ),
         (
-            "xgb_depth5_lr003",
+            "xgb_depth5_lr002",
             XGBClassifier(
-                n_estimators=700,
+                n_estimators=1000,
                 max_depth=5,
-                learning_rate=0.03,
+                learning_rate=0.02,
                 subsample=0.9,
                 colsample_bytree=0.9,
                 reg_lambda=2.0,
+                reg_alpha=0.5,
+                min_child_weight=20,
                 **common,
             ),
         ),
@@ -406,13 +416,26 @@ def max_drawdown(returns: pd.Series) -> float:
     return drawdown.min()
 
 
-def portfolio_summary(portfolio_df: pd.DataFrame, risk_free_monthly: float = 0.0) -> pd.DataFrame:
+def portfolio_summary(
+    portfolio_df: pd.DataFrame,
+    risk_free_monthly: float = 0.0,
+    transaction_cost: float = 0.0,
+) -> pd.DataFrame:
+    # cost per month per leg: 2× one-way for single legs, 4× for the combined long-short
+    cost_map = {
+        "long_return": 2 * transaction_cost,
+        "short_return": 2 * transaction_cost,
+        "long_short_return": 4 * transaction_cost,
+    }
     rows = []
     for model, group in portfolio_df.groupby("model", sort=False):
         for column in ["long_return", "short_return", "long_short_return"]:
             returns = group[column]
             excess = returns - risk_free_monthly
             std = excess.std()
+            returns_ac = returns - cost_map[column]
+            excess_ac = returns_ac - risk_free_monthly
+            std_ac = excess_ac.std()
             rows.append(
                 {
                     "model": model,
@@ -423,31 +446,30 @@ def portfolio_summary(portfolio_df: pd.DataFrame, risk_free_monthly: float = 0.0
                     "annualized_sharpe": float("nan") if std == 0 else excess.mean() / std * sqrt(12),
                     "max_drawdown": max_drawdown(returns),
                     "cumulative_return": (1 + returns).prod() - 1,
+                    "mean_monthly_return_ac": returns_ac.mean(),
+                    "annualized_return_ac": (1 + returns_ac.mean()) ** 12 - 1,
+                    "annualized_sharpe_ac": float("nan") if std_ac == 0 else excess_ac.mean() / std_ac * sqrt(12),
+                    "max_drawdown_ac": max_drawdown(returns_ac),
+                    "cumulative_return_ac": (1 + returns_ac).prod() - 1,
                 }
             )
     return pd.DataFrame(rows)
 
 
-def main() -> int:
-    args = parse_args()
-    deps = import_ml_dependencies()
-
-    data_path = Path(args.data)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    df = load_panel(data_path)
-    feature_columns = get_feature_columns(df)
-
-    train = df[df["split"] == "train"]
-    valid = df[df["split"] == "valid"]
-    sim = df[df["split"] == "sim"]
-
-    X_train = train[feature_columns]
+def run_single_seed(
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    sim: pd.DataFrame,
+    feature_cols: list[str],
+    args: argparse.Namespace,
+    seed: int,
+    deps: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    X_train = train[feature_cols]
     y_train = train["label"]
-    X_valid = valid[feature_columns]
+    X_valid = valid[feature_cols]
     y_valid = valid["label"]
-    X_sim = sim[feature_columns]
+    X_sim = sim[feature_cols]
     y_sim = sim["label"]
 
     negative_count = int((y_train == 0).sum())
@@ -455,13 +477,10 @@ def main() -> int:
     scale_pos_weight = negative_count / positive_count
 
     rf_name, rf_model, rf_threshold, rf_valid_rows = select_best_model(
-        rf_candidates(deps["RandomForestClassifier"], args.random_state, args.n_jobs),
-        X_train,
-        y_train,
-        X_valid,
-        y_valid,
-        deps,
+        rf_candidates(deps["RandomForestClassifier"], seed, args.n_jobs),
+        X_train, y_train, X_valid, y_valid, deps,
     )
+
     train_dates_sorted = sorted(train["Dates"].unique())
     n_full_dates = len(train_dates_sorted)
     n_inner_dates = max(1, int(n_full_dates * 0.8))
@@ -470,26 +489,17 @@ def main() -> int:
     if early_stop_mask.all() or not early_stop_mask.any():
         raise ValueError("Cannot create internal XGBoost early-stopping split from train dates.")
 
-    X_train_inner = train.loc[~early_stop_mask, feature_columns]
+    X_train_inner = train.loc[~early_stop_mask, feature_cols]
     y_train_inner = train.loc[~early_stop_mask, "label"]
-    X_early_stop = train.loc[early_stop_mask, feature_columns]
+    X_early_stop = train.loc[early_stop_mask, feature_cols]
     y_early_stop = train.loc[early_stop_mask, "label"]
 
     xgb_name, xgb_model, xgb_threshold, xgb_valid_rows = select_xgb_model(
-        xgb_candidates(
-            deps["XGBClassifier"],
-            args.random_state,
-            args.n_jobs,
-            scale_pos_weight,
-        ),
-        X_train_inner,
-        y_train_inner,
-        X_early_stop,
-        y_early_stop,
-        X_train,
-        y_train,
-        X_valid,
-        y_valid,
+        xgb_candidates(deps["XGBClassifier"], seed, args.n_jobs, scale_pos_weight),
+        X_train_inner, y_train_inner,
+        X_early_stop, y_early_stop,
+        X_train, y_train,
+        X_valid, y_valid,
         deps,
         scale_factor=n_full_dates / n_inner_dates,
     )
@@ -522,22 +532,14 @@ def main() -> int:
     )
 
     metrics_df = pd.DataFrame(metrics, columns=METRIC_COLUMNS)
-    metrics_path = out_dir / "metrics.csv"
-    metrics_df.to_csv(metrics_path, index=False)
+    metrics_df["seed"] = seed
 
     sim_predictions = sim[["Dates", "stkcd", "y_next", "label"]].copy()
     sim_predictions["rf_prob"] = rf_sim_prob
     sim_predictions["xgb_prob"] = xgb_sim_prob
     sim_predictions["rf_pred"] = (sim_predictions["rf_prob"] >= rf_threshold).astype(int)
     sim_predictions["xgb_pred"] = (sim_predictions["xgb_prob"] >= xgb_threshold).astype(int)
-    sim_predictions.to_csv(out_dir / "sim_predictions.csv", index=False)
-
-    feature_importance(rf_model, feature_columns).to_csv(
-        out_dir / "feature_importance_rf.csv", index=False
-    )
-    feature_importance(xgb_model, feature_columns).to_csv(
-        out_dir / "feature_importance_xgb.csv", index=False
-    )
+    sim_predictions["seed"] = seed
 
     portfolios = pd.concat(
         [
@@ -546,19 +548,89 @@ def main() -> int:
         ],
         ignore_index=True,
     )
-    portfolios.to_csv(out_dir / "portfolio_returns.csv", index=False)
-    portfolio_summary(portfolios, risk_free_monthly=args.risk_free_monthly).to_csv(
-        out_dir / "portfolio_summary.csv", index=False
-    )
+    portfolios["seed"] = seed
 
-    print(f"Selected Random Forest: {rf_name}")
-    print(f"Selected XGBoost: {xgb_name}")
-    print(f"RF validation threshold: {rf_threshold:.2f}")
-    print(f"XGBoost validation threshold: {xgb_threshold:.2f}")
-    print(f"XGBoost scale_pos_weight from train split: {scale_pos_weight:.4f}")
+    rf_imp = feature_importance(rf_model, feature_cols)
+    xgb_imp = feature_importance(xgb_model, feature_cols)
+
+    print(f"[seed={seed}] RF: {rf_name}, XGBoost: {xgb_name}")
+    print(f"[seed={seed}] RF threshold: {rf_threshold:.2f}, XGBoost threshold: {xgb_threshold:.2f}")
+    print(f"[seed={seed}] XGBoost scale_pos_weight: {scale_pos_weight:.4f}")
+
+    return metrics_df, portfolios, sim_predictions, rf_imp, xgb_imp
+
+
+def main() -> int:
+    args = parse_args()
+    deps = import_ml_dependencies()
+
+    data_path = Path(args.data)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = load_panel(data_path)
+    feature_cols = get_feature_columns(df)
+
+    train = df[df["split"] == "train"]
+    valid = df[df["split"] == "valid"]
+    sim = df[df["split"] == "sim"]
+
+    all_metrics: list[pd.DataFrame] = []
+    all_portfolios: list[pd.DataFrame] = []
+    all_sim_predictions: list[pd.DataFrame] = []
+    all_rf_imps: list[pd.DataFrame] = []
+    all_xgb_imps: list[pd.DataFrame] = []
+
+    for seed in args.random_seeds:
+        m, p, s, ri, xi = run_single_seed(train, valid, sim, feature_cols, args, seed, deps)
+        all_metrics.append(m)
+        all_portfolios.append(p)
+        all_sim_predictions.append(s)
+        all_rf_imps.append(ri)
+        all_xgb_imps.append(xi)
+
+    metrics_df = pd.concat(all_metrics, ignore_index=True)
+    portfolios_df = pd.concat(all_portfolios, ignore_index=True)
+
+    metrics_path = out_dir / "metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False)
+    pd.concat(all_sim_predictions, ignore_index=True).to_csv(out_dir / "sim_predictions.csv", index=False)
+
+    def avg_importance(imps: list[pd.DataFrame]) -> pd.DataFrame:
+        if len(imps) == 1:
+            return imps[0]
+        return (
+            pd.concat(imps)
+            .groupby("feature", sort=False)["importance"]
+            .mean()
+            .reset_index()
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    avg_importance(all_rf_imps).to_csv(out_dir / "feature_importance_rf.csv", index=False)
+    avg_importance(all_xgb_imps).to_csv(out_dir / "feature_importance_xgb.csv", index=False)
+
+    portfolios_df.to_csv(out_dir / "portfolio_returns.csv", index=False)
+    portfolio_summary(
+        portfolios_df,
+        risk_free_monthly=args.risk_free_monthly,
+        transaction_cost=args.transaction_cost,
+    ).to_csv(out_dir / "portfolio_summary.csv", index=False)
+
+    if len(args.random_seeds) > 1:
+        sim_sel = metrics_df[
+            (metrics_df["split"] == "sim") & (metrics_df["threshold_source"] == "held_out")
+        ]
+        for label, mask in [
+            ("RF", sim_sel["model"].str.contains("rf", case=False)),
+            ("XGB", sim_sel["model"].str.contains("xgb", case=False)),
+        ]:
+            grp = sim_sel.loc[mask, "auc"]
+            if not grp.empty:
+                print(f"[aggregate {label}] sim AUC = {grp.mean():.4f} ± {grp.std():.4f}")
+
     print(f"Saved metrics: {metrics_path}")
-    print(f"Saved simulation predictions: {out_dir / 'sim_predictions.csv'}")
-    print(f"Saved portfolio outputs: {out_dir / 'portfolio_returns.csv'}")
     print(
         "Note: valid metrics use threshold optimized on the same split. "
         "sim metrics are held_out and unbiased."

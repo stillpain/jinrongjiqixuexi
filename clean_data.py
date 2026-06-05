@@ -66,6 +66,19 @@ def parse_args() -> argparse.Namespace:
                         help="First YYYYMM of simulation period.")
     parser.add_argument("--sim-end",     type=int, default=SIM_END,
                         help="Last YYYYMM of simulation period.")
+    parser.add_argument(
+        "--rank-normalize",
+        action="store_true",
+        help="Replace raw feature values with within-month percentile ranks [0, 1].",
+    )
+    parser.add_argument(
+        "--relative-label",
+        action="store_true",
+        help=(
+            "Label = 1 if y_next > monthly cross-sectional median, else 0. "
+            "Aligns training objective with long-short portfolio construction."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -144,6 +157,16 @@ def assign_split(
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     return [col for col in df.columns if col not in NON_FEATURE_COLUMNS]
+
+
+def rank_normalize_features(df: pd.DataFrame) -> pd.DataFrame:
+    features = feature_columns(df)
+    df = df.copy()
+    df[features] = (
+        df.groupby("Dates", sort=False)[features]
+        .transform(lambda col: col.rank(pct=True, na_option="keep"))
+    )
+    return df
 
 
 def handle_feature_missing(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
@@ -230,6 +253,8 @@ def build_cleaned_panel(
     valid_end: int = VALID_END,
     sim_start: int = SIM_START,
     sim_end: int = SIM_END,
+    rank_normalize: bool = False,
+    relative_label: bool = False,
 ) -> pd.DataFrame:
     stock = load_stock_panel(stock_path)
     macro = load_lagged_macro(macro_path)
@@ -240,7 +265,12 @@ def build_cleaned_panel(
     if not keep_zero_return:
         cleaned = cleaned[cleaned["y_next"] != 0].copy()
 
-    cleaned["label"] = (cleaned["y_next"] > 0).astype(int)
+    if relative_label:
+        monthly_median = cleaned.groupby("Dates")["y_next"].transform("median")
+        cleaned["label"] = (cleaned["y_next"] > monthly_median).astype(int)
+    else:
+        cleaned["label"] = (cleaned["y_next"] > 0).astype(int)
+
     cleaned["split"] = assign_split(
         cleaned["Dates"],
         train_start, train_end, valid_start, valid_end, sim_start, sim_end,
@@ -248,6 +278,8 @@ def build_cleaned_panel(
     cleaned = cleaned.dropna(subset=["split"]).copy()
     cleaned = cleaned.sort_values(["Dates", "stkcd"]).reset_index(drop=True)
     cleaned = handle_feature_missing(cleaned, missing_strategy)
+    if rank_normalize:
+        cleaned = rank_normalize_features(cleaned)
     cleaned = cleaned.sort_values(["Dates", "stkcd"]).reset_index(drop=True)
 
     validate_cleaned(cleaned, allow_feature_na=missing_strategy == "none")
@@ -296,6 +328,8 @@ def main() -> None:
         valid_end=args.valid_end,
         sim_start=args.sim_start,
         sim_end=args.sim_end,
+        rank_normalize=args.rank_normalize,
+        relative_label=args.relative_label,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cleaned.to_csv(out_path, index=False)
