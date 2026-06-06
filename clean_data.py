@@ -14,6 +14,7 @@ SIM_END = 201911
 ID_COLUMNS = ["Dates", "stkcd"]
 TARGET_COLUMN = "y"
 MACRO_COLUMNS = ["Vol", "GDPgrowth", "CPIgrowth"]
+LAGGED_MACRO_COLUMNS = [f"macro_lag1_{col}" for col in MACRO_COLUMNS]
 NON_FEATURE_COLUMNS = {"Dates", "stkcd", "y", "y_next", "label", "split"}
 
 
@@ -160,8 +161,10 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def rank_normalize_features(df: pd.DataFrame) -> pd.DataFrame:
-    features = feature_columns(df)
+    features = [col for col in feature_columns(df) if col not in LAGGED_MACRO_COLUMNS]
     df = df.copy()
+    if not features:
+        return df
     df[features] = (
         df.groupby("Dates", sort=False)[features]
         .transform(lambda col: col.rank(pct=True, na_option="keep"))
